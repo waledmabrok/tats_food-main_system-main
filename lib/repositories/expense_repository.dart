@@ -76,8 +76,10 @@ class ExpenseRepository {
   }
 
   Future<void> _ensureShiftAccess() async {
-    final shift = await _db.getCurrentShift();
     final user = SessionService.instance.currentUser;
+    if (user?.role == 'manager') return; // الأدمن يسجل مصروف في أي وقت
+
+    final shift = await _db.getCurrentShift();
     if (shift != null && user?.id != shift['user_id'] as String?) {
       throw StateError('لا يمكن تسجيل مصروف أثناء شيفت مستخدم آخر');
     }

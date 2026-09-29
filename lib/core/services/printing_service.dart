@@ -17,6 +17,10 @@ class PrintingService {
   pw.Font? _arabicFontBold;
   pw.MemoryImage? _logo;
   bool _logoLoadAttempted = false;
+  Future<String> _printNumber(Order order) async {
+    final seq = await DatabaseHelper.instance.getOrderSequenceInShift(order.id);
+    return seq.toString();
+  }
 
   Future<void> _initFonts() async {
     _arabicFont ??= pw.Font.ttf(
@@ -104,10 +108,10 @@ class PrintingService {
 
         // توزيع الأعمدة
         columnWidths: const {
-          0: pw.FlexColumnWidth(4.2), // الصنف
+          0: pw.FlexColumnWidth(2.2), // الصنف
           1: pw.FlexColumnWidth(1.5), // الكمية
           2: pw.FlexColumnWidth(2.0), // السعر
-          3: pw.FlexColumnWidth(2.2), // الإجمالي
+          3: pw.FlexColumnWidth(4.2), // الإجمالي
         },
 
         children: [
@@ -322,7 +326,7 @@ class PrintingService {
     final customer = order.customerId == null
         ? null
         : await DatabaseHelper.instance.getCustomerById(order.customerId!);
-
+    final printNo = await _printNumber(order);
     final pdf = pw.Document();
 
     pdf.addPage(
@@ -386,7 +390,7 @@ class PrintingService {
                       style: pw.TextStyle(font: _arabicFont, fontSize: 10),
                     ),
                     pw.Text(
-                      '#${order.orderNumber}',
+                      '#$printNo',
                       style: pw.TextStyle(font: _arabicFontBold, fontSize: 11),
                     ),
                   ],
@@ -595,7 +599,7 @@ class PrintingService {
 
     await Printing.layoutPdf(
       onLayout: (PdfPageFormat format) async => pdf.save(),
-      name: 'Receipt_${order.orderNumber}',
+      name: 'Receipt_$printNo',
     );
   }
 
@@ -610,6 +614,7 @@ class PrintingService {
     final restaurantNameRaw = await DatabaseHelper.instance.getSetting(
       'restaurant_name',
     );
+    final printNo = await _printNumber(order);
 
     final restaurantName =
         (restaurantNameRaw != null && restaurantNameRaw.trim().isNotEmpty)
@@ -664,7 +669,7 @@ class PrintingService {
                       style: pw.TextStyle(font: _arabicFontBold, fontSize: 14),
                     ),
                     pw.Text(
-                      '#${order.orderNumber}',
+                      '#$printNo',
                       style: pw.TextStyle(font: _arabicFontBold, fontSize: 16),
                     ),
                   ],
@@ -682,14 +687,14 @@ class PrintingService {
                   'نوع الطلب: ${order.orderType.label}',
                   style: pw.TextStyle(font: _arabicFontBold, fontSize: 12),
                 ),
-                if (order.orderType == OrderType.delivery &&
+                /*  if (order.orderType == OrderType.delivery &&
                     order.deliveryAddress != null)
                   pw.Text(
                     'العنوان: ${order.deliveryAddress}',
                     style: pw.TextStyle(font: _arabicFontBold, fontSize: 12),
                   ),
 
-                pw.SizedBox(height: 6),
+                pw.SizedBox(height: 6),*/
 
                 pw.Divider(thickness: 2),
 
@@ -729,7 +734,7 @@ class PrintingService {
 
     await Printing.layoutPdf(
       onLayout: (PdfPageFormat format) async => pdf.save(),
-      name: 'Kitchen_${order.orderNumber}',
+      name: 'Kitchen_$printNo',
     );
   }
 

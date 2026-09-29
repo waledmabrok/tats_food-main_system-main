@@ -61,12 +61,14 @@ const List<NavItem> mainNavItems = [
     icon: Icons.dashboard_outlined,
     activeIcon: Icons.dashboard_rounded,
   ),
+/*
   NavItem(
     route: AppRoutes.cashier,
     label: AppStrings.navCashier,
     icon: Icons.point_of_sale_outlined,
     activeIcon: Icons.point_of_sale_rounded,
   ),
+*/
   NavItem(
     route: AppRoutes.products,
     label: AppStrings.navProducts,

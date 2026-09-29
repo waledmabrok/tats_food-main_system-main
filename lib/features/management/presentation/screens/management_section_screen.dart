@@ -1146,6 +1146,16 @@ class _RecordFormDialogState extends State<_RecordFormDialog> {
   }
 }
 
+// ═══════════════════════════════════════════════════════════════
+// امسح _AccountsScreen و _AccountSummary القدام (وأي نسخة عملتها قبل كده)
+// وحط الكود ده مكانهم. باقي الملف زي ما هو.
+// ═══════════════════════════════════════════════════════════════
+
+// ═══════════════════════════════════════════════════════════════
+// امسح _AccountsScreen و _AccountSummary القدام (وأي نسخة عملتها قبل كده)
+// وحط الكود ده مكانهم. باقي الملف زي ما هو.
+// ═══════════════════════════════════════════════════════════════
+
 class _AccountsScreen extends StatefulWidget {
   const _AccountsScreen();
 
@@ -1154,10 +1164,15 @@ class _AccountsScreen extends StatefulWidget {
 }
 
 class _AccountsScreenState extends State<_AccountsScreen> {
-  List<Map<String, dynamic>> _accounts = [];
-  List<Map<String, dynamic>> _assets = [];
-  Map<String, dynamic>? _profitLoss;
+  Map<String, dynamic> _o = {}; // ملخص الفترة
+  Map<String, dynamic> _t = {}; // الدرج الأساسي
+  List<Map<String, dynamic>> _movements = [];
+  List<Map<String, dynamic>> _fixedAssets = [];
   bool _loading = true;
+
+  DateTime? _from;
+  DateTime? _to;
+  String _filterName = 'الكل';
 
   @override
   void initState() {
@@ -1167,87 +1182,573 @@ class _AccountsScreenState extends State<_AccountsScreen> {
 
   Future<void> _load() async {
     setState(() => _loading = true);
-    await DatabaseHelper.instance.postAssetDepreciation();
-    final accounts = await DatabaseHelper.instance.getAccounts();
-    final assets = await DatabaseHelper.instance.getFixedAssets();
-    final pl = await DatabaseHelper.instance.getProfitLossReport();
+    final db = DatabaseHelper.instance;
+    await db.postAssetDepreciation(); // ترحيل إهلاك الشهور اللي عدت
+    final assets = await db.getFixedAssets();
+    final o = await db.getAccountsOverview(from: _from, to: _to);
+    final t = await db.getTreasuryOverview();
+    final m = await db.getTreasuryMovements(limit: 10);
     if (mounted) {
       setState(() {
-        _accounts = accounts;
-        _assets = assets;
-        _profitLoss = pl;
+        _o = o;
+        _t = t;
+        _movements = m;
+        _fixedAssets = assets;
         _loading = false;
       });
     }
   }
 
-  String _typeLabel(String type) => switch (type) {
-        'asset' => 'أصل',
-        'liability' => 'التزام',
-        'equity' => 'حقوق ملكية',
-        'revenue' => 'إيراد',
-        'expense' => 'مصروف',
-        _ => type,
-      };
+  // ─── أدوات مساعدة ────────────────────────────────
+  double _n(Map<String, dynamic> m, String k) =>
+      (m[k] as num?)?.toDouble() ?? 0;
+  String _two(int n) => n.toString().padLeft(2, '0');
+  String _fmtDate(DateTime d) => '${d.year}-${_two(d.month)}-${_two(d.day)}';
+  String _fmtDateTime(String? iso) =>
+      iso == null ? '' : iso.substring(0, 16).replaceFirst('T', ' ');
+  String _money(num? v) => '${(v ?? 0).toDouble().toStringAsFixed(2)} ج.م';
 
-  List<Map<String, dynamic>> get _orderedAccounts {
-    final result = <Map<String, dynamic>>[];
-    void addChildren(String? parentId, int level) {
-      final children = _accounts
-          .where((account) => account['parent_id'] == parentId)
-          .toList();
-      for (final account in children) {
-        result.add({...account, '_level': level});
-        addChildren(account['id'] as String, level + 1);
-      }
-    }
-
-    addChildren(null, 0);
-    return result;
+  void _setRange(String name, DateTime? from, DateTime? to) {
+    _filterName = name;
+    _from = from;
+    _to = to;
+    _load();
   }
 
-  double _sumByType(String type) =>
-      _accounts.where((account) => account['type'] == type).fold(0,
-          (sum, account) => sum + (account['balance'] as num).toDouble().abs());
-
-  Future<void> _showTransactions(Map<String, dynamic> account) async {
-    final rows = await DatabaseHelper.instance.rawQuery(
-      '''SELECT created_at, debit, credit, description, ref_type
-         FROM account_transactions WHERE account_id = ?
-         ORDER BY created_at DESC LIMIT 100''',
-      [account['id']],
+  Future<void> _pickRange() async {
+    final now = DateTime.now();
+    final picked = await showDateRangePicker(
+      context: context,
+      firstDate: DateTime(2020),
+      lastDate: DateTime(now.year, now.month, now.day + 1),
+      initialDateRange: _from != null && _to != null
+          ? DateTimeRange(start: _from!, end: _to!)
+          : null,
     );
+    if (picked != null) {
+      _setRange('${_fmtDate(picked.start)}  ←  ${_fmtDate(picked.end)}',
+          picked.start, picked.end);
+    }
+  }
+
+  String _mvMethodLabel(String? m) => switch (m) {
+        'vodafone' => 'فودافون كاش',
+        'card' => 'فيزا / شبكة',
+        'other' => 'أخرى',
+        _ => 'كاش',
+      };
+  Future<void> _moveMoney(String type) async {
+    final amountC = TextEditingController();
+    final notesC = TextEditingController();
+    String method = 'cash';
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (_) => StatefulBuilder(
+        builder: (context, setLocal) => AlertDialog(
+          title: Text(type == 'deposit' ? 'إيداع' : 'سحب'),
+          content: SizedBox(
+            width: 380,
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                DropdownButtonFormField<String>(
+                  initialValue: method,
+                  decoration: const InputDecoration(labelText: 'الطريقة'),
+                  items: const [
+                    DropdownMenuItem(value: 'cash', child: Text('كاش (الدرج)')),
+                    DropdownMenuItem(
+                        value: 'vodafone', child: Text('فودافون كاش')),
+                    DropdownMenuItem(value: 'card', child: Text('فيزا / شبكة')),
+                    DropdownMenuItem(value: 'other', child: Text('أخرى')),
+                  ],
+                  onChanged: (v) => setLocal(() => method = v!),
+                ),
+                const SizedBox(height: AppDimensions.space16),
+                TextField(
+                  controller: amountC,
+                  keyboardType:
+                      const TextInputType.numberWithOptions(decimal: true),
+                  decoration: const InputDecoration(labelText: 'المبلغ'),
+                ),
+                const SizedBox(height: AppDimensions.space16),
+                TextField(
+                  controller: notesC,
+                  decoration: InputDecoration(
+                    labelText: 'ملاحظات',
+                    helperText: type == 'deposit'
+                        ? 'مثال: رصيد افتتاحي / رأس مال'
+                        : 'مثال: سحب أرباح',
+                  ),
+                ),
+              ],
+            ),
+          ),
+          actions: [
+            TextButton(
+                onPressed: () => Navigator.pop(context, false),
+                child: const Text('إلغاء')),
+            FilledButton(
+                onPressed: () => Navigator.pop(context, true),
+                child: const Text('حفظ')),
+          ],
+        ),
+      ),
+    );
+    final amount = double.tryParse(_arabicToEnglish(amountC.text.trim())) ?? 0;
+    final notes = notesC.text.trim();
+    amountC.dispose();
+    notesC.dispose();
+    if (ok == true && amount > 0) {
+      await DatabaseHelper.instance.addTreasuryMovement(
+        type: type,
+        amount: amount,
+        method: method,
+        notes: notes.isEmpty ? null : notes,
+      );
+      _load();
+    }
+  }
+
+  // ─── مكونات الواجهة ──────────────────────────────
+  Widget _row(String label, num? v,
+      {Color? color, bool bold = false, String? text, double indent = 0}) {
+    final style = bold ? AppTypography.titleMedium : AppTypography.bodyMedium;
+    return Padding(
+      padding: EdgeInsets.only(top: 6, bottom: 6, right: indent),
+      child: Row(
+        children: [
+          Expanded(child: Text(label, style: style)),
+          Text(text ?? _money(v), style: style.copyWith(color: color)),
+        ],
+      ),
+    );
+  }
+
+  Widget _section(String title, IconData icon, List<Widget> children,
+      {Widget? trailing}) {
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.all(AppDimensions.space16),
+      decoration: BoxDecoration(
+        color: AppColors.surface,
+        borderRadius: BorderRadius.circular(AppDimensions.radiusMd),
+        border: Border.all(color: AppColors.border),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              Icon(icon, color: AppColors.primary),
+              const SizedBox(width: AppDimensions.space8),
+              Expanded(child: Text(title, style: AppTypography.titleLarge)),
+              if (trailing != null) trailing,
+            ],
+          ),
+          const Divider(height: AppDimensions.space24),
+          ...children,
+        ],
+      ),
+    );
+  }
+
+  Widget _filterBar() {
+    final now = DateTime.now();
+    final today = DateTime(now.year, now.month, now.day);
+    Widget chip(String label, VoidCallback onTap) => ChoiceChip(
+          label: Text(label),
+          selected: _filterName == label,
+          onSelected: (_) => onTap(),
+        );
+    return Wrap(
+      spacing: AppDimensions.space8,
+      runSpacing: AppDimensions.space8,
+      crossAxisAlignment: WrapCrossAlignment.center,
+      children: [
+        chip('الكل', () => _setRange('الكل', null, null)),
+        chip('اليوم', () => _setRange('اليوم', today, today)),
+        chip(
+            'آخر 7 أيام',
+            () => _setRange(
+                'آخر 7 أيام', today.subtract(const Duration(days: 6)), today)),
+        chip(
+            'هذا الشهر',
+            () => _setRange(
+                'هذا الشهر', DateTime(now.year, now.month, 1), today)),
+        ActionChip(
+          avatar: const Icon(Icons.date_range_rounded, size: 18),
+          label: Text(_filterName.contains('←') ? _filterName : 'تاريخ محدد'),
+          onPressed: _pickRange,
+        ),
+      ],
+    );
+  }
+
+  // ─── 1) الدرج الأساسي ────────────────────────────
+  Widget _treasurySection() {
+    final balance = _n(_t, 'balance');
+    final diff = _n(_t, 'shift_diff');
+    return _section(
+      'الدرج الأساسي (الخزينة)',
+      Icons.savings_rounded,
+      [
+        Center(
+          child: Column(
+            children: [
+              Text('الفلوس اللي معاك دلوقتي', style: AppTypography.bodySmall),
+              const SizedBox(height: AppDimensions.space4),
+              Text(_money(balance),
+                  style: AppTypography.titleLarge.copyWith(
+                      fontSize: 34,
+                      color:
+                          balance >= 0 ? AppColors.success : AppColors.error)),
+            ],
+          ),
+        ),
+        const SizedBox(height: AppDimensions.space12),
+        Text('داخل', style: AppTypography.titleSmall),
+        _row('مبيعات نقدي (كل الشيفتات)', _n(_t, 'cash_sales'), indent: 12),
+        _row('إيداعات', _n(_t, 'deposits'), indent: 12),
+        if (diff > 0) _row('زيادة في الشيفتات', diff, indent: 12),
+        _row('إجمالي الداخل', _n(_t, 'total_in'),
+            bold: true, color: AppColors.success),
+        const SizedBox(height: AppDimensions.space8),
+        Text('خارج', style: AppTypography.titleSmall),
+        _row('مصاريف', _n(_t, 'expenses_cash'), indent: 12),
+        _row('مشتريات وسداد موردين', _n(_t, 'purchases_cash'), indent: 12),
+        _row('رواتب وسلف', _n(_t, 'payroll'), indent: 12),
+        _row('شراء أصول ثابتة', _n(_t, 'assets_cash'), indent: 12),
+        _row('سحوبات', _n(_t, 'withdrawals'), indent: 12),
+        if (diff < 0) _row('عجز في الشيفتات', -diff, indent: 12),
+        _row('إجمالي الخارج', _n(_t, 'total_out'),
+            bold: true, color: AppColors.error),
+        const SizedBox(height: AppDimensions.space8),
+        Text('أرصدة الطرق الأخرى', style: AppTypography.titleSmall),
+        if ((_t['method_balances'] as List? ?? []).isEmpty)
+          Text('لا توجد حركات على فيزا / فودافون',
+              style: AppTypography.bodySmall),
+        for (final r in (_t['method_balances'] as List? ?? [])
+            .cast<Map<String, dynamic>>())
+          _row(
+            _mvMethodLabel(r['method'] as String?),
+            r['balance'] as num,
+            indent: 12,
+            color: (r['balance'] as num) >= 0
+                ? AppColors.success
+                : AppColors.error,
+          ),
+        const SizedBox(height: AppDimensions.space12),
+        Row(
+          children: [
+            FilledButton.icon(
+              onPressed: () => _moveMoney('deposit'),
+              icon: const Icon(Icons.add_rounded),
+              label: const Text('إيداع'),
+            ),
+            const SizedBox(width: AppDimensions.space8),
+            OutlinedButton.icon(
+              onPressed: () => _moveMoney('withdraw'),
+              icon: const Icon(Icons.remove_rounded),
+              label: const Text('سحب'),
+            ),
+          ],
+        ),
+        if (_movements.isNotEmpty) ...[
+          const Divider(height: AppDimensions.space24),
+          Text('آخر الإيداعات والسحوبات', style: AppTypography.titleSmall),
+          for (final m in _movements)
+            Material(
+              type: MaterialType.transparency,
+              child: ListTile(
+                dense: true,
+                contentPadding: EdgeInsets.zero,
+                leading: Icon(
+                  m['type'] == 'deposit'
+                      ? Icons.south_west_rounded
+                      : Icons.north_east_rounded,
+                  color: m['type'] == 'deposit'
+                      ? AppColors.success
+                      : AppColors.error,
+                ),
+                title: Text(m['notes'] as String? ??
+                    (m['type'] == 'deposit' ? 'إيداع' : 'سحب')),
+                subtitle: Text(
+                    '${_mvMethodLabel(m['method'] as String?)} • ${_fmtDateTime(m['created_at'] as String?)}'),
+                trailing: Text(
+                  '${m['type'] == 'deposit' ? '+' : '-'}${_money(m['amount'] as num)}',
+                  style: AppTypography.bodyMedium.copyWith(
+                      color: m['type'] == 'deposit'
+                          ? AppColors.success
+                          : AppColors.error),
+                ),
+              ),
+            ),
+        ],
+      ],
+    );
+  }
+
+  // ─── 2) الشيفتات ─────────────────────────────────
+  Widget _shiftSection() {
+    final hasOpen = _o['has_open_shift'] == true;
+    final lastCash = _o['last_closing_cash'] as double?;
+    return _section('الشيفتات', Icons.point_of_sale_rounded, [
+      _row('الشيفت الحالي', null,
+          text: hasOpen ? 'مفتوح' : 'مغلق',
+          color: hasOpen ? AppColors.success : AppColors.warning),
+      if (hasOpen) _row('المتوقع في درج الكاشير الآن', _n(_o, 'shift_drawer')),
+      _row('آخر فلوس اتسلّمت عند قفل شيفت', null,
+          text: lastCash == null ? 'لا يوجد' : _money(lastCash)),
+      if (lastCash != null)
+        Text(
+            '${_fmtDateTime(_o['last_closing_at'] as String?)} • ${_o['last_closing_user'] ?? ''}',
+            style: AppTypography.caption),
+    ]);
+  }
+
+  // ─── الدخل حسب طريقة الدفع ───────────────────────
+  String _methodLabel(String m) => switch (m.toLowerCase()) {
+        'cash' => 'كاش',
+        'card' => 'فيزا / شبكة',
+        'visa' => 'فيزا',
+        'network' || 'pos' || 'shabaka' => 'شبكة',
+        'vodafone_cash' ||
+        'vodafone' ||
+        'vodafonecash' ||
+        'wallet' ||
+        'mobile_wallet' =>
+          'فودافون كاش',
+        'instapay' => 'إنستاباي',
+        _ => m, // أي طريقة غير معروفة تظهر باسمها زي ما هي متخزنة
+      };
+  String _norm(String m) => switch (m.toLowerCase()) {
+        'card' || 'visa' || 'network' || 'pos' || 'shabaka' => 'card',
+        'vodafone_cash' ||
+        'vodafone' ||
+        'vodafonecash' ||
+        'wallet' ||
+        'mobile_wallet' =>
+          'vodafone',
+        final x => x,
+      };
+  IconData _methodIcon(String m) => switch (m.toLowerCase()) {
+        'cash' => Icons.payments_outlined,
+        'card' ||
+        'visa' ||
+        'network' ||
+        'pos' ||
+        'shabaka' =>
+          Icons.credit_card_rounded,
+        _ => Icons.phone_android_rounded,
+      };
+
+  Widget _paymentMethodsSection() {
+    final rows =
+        (_o['sales_by_method'] as List?)?.cast<Map<String, dynamic>>() ?? [];
+    rows.sort((a, b) => (b['total'] as num).compareTo(a['total'] as num));
+    return _section('الدخل حسب طريقة الدفع — $_filterName',
+        Icons.account_balance_wallet_outlined, [
+      if (rows.isEmpty)
+        Text('لا توجد مبيعات في الفترة دي', style: AppTypography.bodySmall),
+      for (final r in rows)
+        Padding(
+          padding: const EdgeInsets.symmetric(vertical: 6),
+          child: Row(
+            children: [
+              Icon(_methodIcon(r['method'] as String),
+                  color: AppColors.primary, size: 22),
+              const SizedBox(width: AppDimensions.space12),
+              Expanded(
+                child: Text(
+                    '${_methodLabel(r['method'] as String)}  (${r['cnt']} أوردر)',
+                    style: AppTypography.bodyMedium),
+              ),
+              Text(_money(r['total'] as num),
+                  style: AppTypography.titleMedium
+                      .copyWith(color: AppColors.success)),
+            ],
+          ),
+        ),
+      const Divider(),
+      _row('الإجمالي', _n(_o, 'total_sales'), bold: true),
+    ]);
+  }
+
+  // ─── الدخل بعد المصروفات (نفس التقسيم حسب طريقة الدفع) ──
+  Widget _afterExpensesSection() {
+    final rows =
+        ((_o['sales_by_method'] as List?)?.cast<Map<String, dynamic>>() ?? [])
+            .toList();
+
+    final expenses = _n(_o, 'expenses_total');
+    final payroll = _n(_o, 'payroll');
+    final suppliers = _n(_o, 'excluded_duplicates'); // مشتريات + سداد موردين
+    final totalOut = expenses + payroll + suppliers;
+
+    // مبيعات كل طريقة (بعد توحيد الأسماء)
+    final totals = <String, double>{};
+    for (final r in rows) {
+      final k = _norm(r['method'] as String);
+      totals[k] = (totals[k] ?? 0) + (r['total'] as num).toDouble();
+    }
+    // الإيداعات (+) والسحوبات (−)
+    final mv = (_o['movements_by_method'] as Map?) ?? {};
+    for (final e in mv.entries) {
+      final k = _norm(e.key as String);
+      totals[k] = (totals[k] ?? 0) + (e.value as num).toDouble();
+    }
+    // المصروفات بتتدفع من الدرج
+    if (totalOut > 0) totals['cash'] = (totals['cash'] ?? 0) - totalOut;
+
+    final entries = totals.entries
+        .map((e) => MapEntry(
+            e.key == 'cash' ? 'كاش (بعد المصروفات)' : _methodLabel(e.key),
+            e.value))
+        .toList()
+      ..sort((a, b) => b.value.compareTo(a.value));
+
+    final net = entries.fold<double>(0, (s, e) => s + e.value);
+
+    return _section('الدخل بعد المصروفات — $_filterName',
+        Icons.account_balance_wallet_rounded, [
+      _row('− المصاريف', expenses, color: AppColors.warning),
+      _row('− رواتب وسلف', payroll, color: AppColors.warning),
+      _row('− مشتريات وسداد موردين', suppliers, color: AppColors.warning),
+      _row('إجمالي المصروفات', totalOut, bold: true, color: AppColors.warning),
+      Text('المصروفات بتتخصم من الكاش لأنها بتتدفع من الدرج',
+          style: AppTypography.caption),
+      const Divider(),
+      for (final e in entries)
+        _row(e.key, e.value,
+            color: e.value < 0 ? AppColors.error : AppColors.success),
+      const Divider(),
+      _row('الإجمالي بعد المصروفات', net,
+          bold: true, color: net >= 0 ? AppColors.success : AppColors.error),
+    ]);
+  }
+
+  // ─── 3) الأرباح والخسائر للفترة ──────────────────
+  Widget _profitSection() {
+    final byCat =
+        (_o['expenses_by_category'] as Map?)?.cast<String, double>() ?? {};
+    final net = _n(_o, 'net_profit');
+    return _section(
+        'المبيعات والأرباح — $_filterName', Icons.bar_chart_rounded, [
+      _row('إجمالي المبيعات (${_o['orders_count'] ?? 0} أوردر)',
+          _n(_o, 'total_sales'),
+          bold: true, color: AppColors.success),
+      _row('− تكلفة البضاعة المباعة', _n(_o, 'cogs_total')),
+      _row('= مجمل الربح', _n(_o, 'gross_profit'), bold: true),
+      const Divider(),
+      _row('− المصاريف', _n(_o, 'expenses_total'), color: AppColors.warning),
+      for (final e in byCat.entries) _row(e.key, e.value, indent: 12),
+      if (_n(_o, 'excluded_duplicates') > 0)
+        Padding(
+          padding: const EdgeInsets.only(bottom: 4),
+          child: Text(
+              'مستبعد ${_money(_n(_o, 'excluded_duplicates'))} (دفعات موردين/مشتريات متسجلة كمصروف — تكلفتها محسوبة في تكلفة البضاعة)',
+              style: AppTypography.caption),
+        ),
+      Wrap(
+        spacing: AppDimensions.space8,
+        children: [
+          TextButton.icon(
+            onPressed: _showExpenses,
+            icon: const Icon(Icons.list_alt_rounded, size: 18),
+            label: const Text('عرض كل المصاريف'),
+          ),
+          /*  TextButton.icon(
+            onPressed: _showDiagnostics,
+            icon: const Icon(Icons.bug_report_outlined, size: 18),
+            label: const Text('فحص البيانات'),
+          ),*/
+        ],
+      ),
+      _row('− رواتب وسلف', _n(_o, 'payroll'), color: AppColors.warning),
+      const Divider(),
+      _row('المبيعات − المصاريف والرواتب', null,
+          text: _money(_n(_o, 'total_sales') -
+              _n(_o, 'expenses_total') -
+              _n(_o, 'payroll'))),
+      _row('صافي الربح', net,
+          bold: true, color: net >= 0 ? AppColors.success : AppColors.error),
+    ]);
+  }
+
+  Future<void> _showDiagnostics() async {
+    final d = await DatabaseHelper.instance.getDataDiagnostics();
+    if (!mounted) return;
+    const titles = {
+      'expenses': 'جدول المصاريف (حسب النوع)',
+      'employee_transactions': 'حركات الموظفين (حسب النوع)',
+      'supplier_payments': 'سداد الموردين (حسب طريقة الدفع)',
+    };
+    String d16(Object? v) =>
+        v == null ? '-' : v.toString().split('.').first.replaceFirst('T', ' ');
+    await showDialog<void>(
+      context: context,
+      builder: (_) => AlertDialog(
+        title: const Text('فحص البيانات المخزّنة'),
+        content: SizedBox(
+          width: 640,
+          height: 460,
+          child: ListView(
+            children: [
+              for (final e in d.entries) ...[
+                Text(titles[e.key] ?? e.key, style: AppTypography.titleSmall),
+                if (e.value.isEmpty)
+                  Text('  (فاضي)', style: AppTypography.bodySmall),
+                for (final r in e.value)
+                  Padding(
+                    padding: const EdgeInsets.symmetric(vertical: 3),
+                    child: Text(
+                        '• ${r['name']} — ${r['cnt']} حركة — ${_money(r['total'] as num)}\n   ${d16(r['min_d'])}  ←  ${d16(r['max_d'])}',
+                        style: AppTypography.bodySmall),
+                  ),
+                const SizedBox(height: AppDimensions.space12),
+              ],
+            ],
+          ),
+        ),
+        actions: [
+          TextButton(
+              onPressed: () => Navigator.pop(context),
+              child: const Text('إغلاق')),
+        ],
+      ),
+    );
+  }
+
+  Future<void> _showExpenses() async {
+    final rows =
+        await DatabaseHelper.instance.getExpensesList(from: _from, to: _to);
     if (!mounted) return;
     await showDialog<void>(
       context: context,
       builder: (_) => AlertDialog(
-        title: Text('حركات ${account['name']}'),
+        title: Text('كل المصاريف — $_filterName'),
         content: SizedBox(
           width: 620,
           height: 460,
           child: rows.isEmpty
-              ? const Center(child: Text('لا توجد حركات على هذا الحساب'))
+              ? const Center(child: Text('لا توجد مصاريف'))
               : ListView.separated(
                   itemCount: rows.length,
                   separatorBuilder: (_, __) => const Divider(height: 1),
-                  itemBuilder: (_, index) {
-                    final row = rows[index];
-                    final debit = (row['debit'] as num).toDouble();
-                    final credit = (row['credit'] as num).toDouble();
+                  itemBuilder: (_, i) {
+                    final r = rows[i];
+                    final excluded = r['excluded'] == true;
                     return ListTile(
-                      title:
-                          Text(row['description'] as String? ?? 'حركة محاسبية'),
+                      dense: true,
+                      title: Text(
+                          '${r['category']} — ${r['description'] ?? ''}',
+                          style: excluded
+                              ? AppTypography.bodyMedium
+                                  .copyWith(color: AppColors.textDisabled)
+                              : AppTypography.bodyMedium),
                       subtitle: Text(
-                          '${row['created_at']} • ${row['ref_type'] ?? ''}'),
-                      trailing: Text(
-                        debit > 0
-                            ? '+${debit.toStringAsFixed(2)} مدين'
-                            : '-${credit.toStringAsFixed(2)} دائن',
-                        style: AppTypography.bodySmall.copyWith(
-                          color:
-                              debit > 0 ? AppColors.success : AppColors.error,
-                        ),
-                      ),
+                          '${_fmtDateTime(r['date'] as String?)}${excluded ? ' • مستبعد (دفعة مورد)' : ''}'),
+                      trailing: Text(_money(r['amount'] as num)),
                     );
                   },
                 ),
@@ -1261,352 +1762,433 @@ class _AccountsScreenState extends State<_AccountsScreen> {
     );
   }
 
-  Future<void> _addAssetDialog() async {
-    final nameCtrl = TextEditingController();
-    final costCtrl = TextEditingController();
-    final lifeCtrl = TextEditingController(text: '12');
-    String category = 'rent';
-    bool isRecurring = true; // الإيجار افتراضيًا متكرر
+  // ─── الأصول الثابتة والإيجارات ───────────────────
+  String _assetCategoryLabel(String c) => switch (c) {
+        'rent' => 'إيجار',
+        'equipment' => 'معدات',
+        'furniture' => 'أثاث',
+        _ => 'أصول ثابتة',
+      };
 
-    final saved = await showDialog<bool>(
-      context: context,
-      builder: (ctx) => StatefulBuilder(
-          builder: (ctx, setD) => AlertDialog(
-                title: const Text('إضافة أصل / مصروف ثابت'),
-                content: SizedBox(
-                    width: 400,
-                    child: Column(mainAxisSize: MainAxisSize.min, children: [
-                      TextField(
-                          controller: nameCtrl,
-                          decoration: const InputDecoration(
-                              labelText: 'الاسم (إيجار المحل، فرن...)')),
-                      const SizedBox(height: 12),
-                      DropdownButtonFormField<String>(
-                        initialValue: category,
-                        items: const [
-                          DropdownMenuItem(value: 'rent', child: Text('إيجار')),
-                          DropdownMenuItem(
-                              value: 'equipment', child: Text('معدات')),
-                          DropdownMenuItem(
-                              value: 'furniture', child: Text('أثاث')),
-                          DropdownMenuItem(value: 'other', child: Text('أخرى')),
-                        ],
-                        onChanged: (v) => setD(() {
-                          category = v!;
-                          isRecurring = category ==
-                              'rent'; // اقتراح تلقائي، والمستخدم يقدر يغيّره
-                        }),
-                        decoration: const InputDecoration(labelText: 'النوع'),
-                      ),
-                      const SizedBox(height: 12),
-                      SwitchListTile(
-                        contentPadding: EdgeInsets.zero,
-                        title: const Text('مصروف متكرر شهريًا؟'),
-                        subtitle: Text(isRecurring
-                            ? 'زي الإيجار — هتسجل دفعة كل شهر بنفسك'
-                            : 'زي المعدات — بيتخصم تدريجيًا (إهلاك) على مدة عمره الافتراضي'),
-                        value: isRecurring,
-                        onChanged: (v) => setD(() => isRecurring = v),
-                      ),
-                      const SizedBox(height: 4),
-                      TextField(
-                          controller: costCtrl,
-                          keyboardType: const TextInputType.numberWithOptions(
-                              decimal: true),
-                          decoration: InputDecoration(
-                              labelText: isRecurring
-                                  ? 'القيمة الشهرية'
-                                  : 'التكلفة الكلية',
-                              suffixText: 'ج.م')),
-                      if (!isRecurring) ...[
-                        const SizedBox(height: 12),
-                        TextField(
-                            controller: lifeCtrl,
-                            keyboardType: TextInputType.number,
-                            decoration: const InputDecoration(
-                                labelText: 'العمر الافتراضي بالشهور',
-                                helperText:
-                                    'هيتخصم من الأرباح تدريجيًا على المدة دي')),
-                      ],
-                    ])),
-                actions: [
-                  TextButton(
-                      onPressed: () => Navigator.pop(ctx, false),
-                      child: const Text('إلغاء')),
-                  FilledButton(
-                      onPressed: () => Navigator.pop(ctx, true),
-                      child: const Text('حفظ')),
-                ],
-              )),
+  IconData _assetIcon(String c) => switch (c) {
+        'rent' => Icons.home_work_outlined,
+        'equipment' => Icons.kitchen_outlined,
+        'furniture' => Icons.chair_alt_outlined,
+        _ => Icons.business_center_outlined,
+      };
+
+  Widget _fixedAssetsSection() {
+    return _section(
+      'الأصول الثابتة والإيجارات',
+      Icons.business_rounded,
+      [
+        if (_fixedAssets.isEmpty)
+          Text('لا توجد أصول أو إيجارات مسجلة', style: AppTypography.bodySmall),
+        for (final a in _fixedAssets) _assetTile(a),
+      ],
+      trailing: FilledButton.icon(
+        onPressed: _addAsset,
+        icon: const Icon(Icons.add_rounded),
+        label: const Text('إضافة أصل / إيجار'),
+      ),
     );
-    if (saved != true) return;
-    final cost = double.tryParse(costCtrl.text.trim()) ?? 0;
-    final life = int.tryParse(lifeCtrl.text.trim()) ?? 12;
-    if (nameCtrl.text.trim().isEmpty || cost <= 0) return;
+  }
 
+  Widget _assetTile(Map<String, dynamic> a) {
+    final cat = a['category'] as String? ?? 'other';
+    final recurring = (a['is_recurring'] as num?) == 1;
+    final cost = (a['cost'] as num).toDouble();
+    final acc = (a['accumulated_depreciation'] as num?)?.toDouble() ?? 0;
+    final life = a['useful_life_months'] as int?;
+    final last = a['last_processed_date'] as String?;
+    final subtitle = recurring
+        ? 'متكرر شهريًا: ${_money(cost)}${last != null ? ' • آخر دفعة: ${_fmtDateTime(last)}' : ' • لسه مفيش دفعات'}'
+        : 'التكلفة: ${_money(cost)} • الإهلاك المتراكم: ${_money(acc)} • المدة: ${life ?? 12} شهر • ${a['payment_type'] == 'cash' ? 'نقدي' : 'آجل'}';
+    return ListTile(
+      contentPadding: EdgeInsets.zero,
+      leading: Icon(_assetIcon(cat), color: AppColors.primary),
+      title: Text('${_assetCategoryLabel(cat)} — ${a['name']}'),
+      subtitle: Text(subtitle, style: AppTypography.bodySmall),
+      trailing: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          if (recurring)
+            IconButton(
+              tooltip: 'تسجيل دفعة شهرية',
+              onPressed: () => _payRecurring(a),
+              icon: const Icon(Icons.payments_outlined),
+            ),
+          IconButton(
+            tooltip: 'حذف',
+            onPressed: () => _deleteAsset(a),
+            icon: Icon(Icons.delete_outline, color: AppColors.error),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Future<void> _addAsset() async {
+    final nameC = TextEditingController();
+    final costC = TextEditingController();
+    final lifeC = TextEditingController(text: '12');
+    final notesC = TextEditingController();
+    String category = 'rent';
+    bool recurring = true;
+    String paymentType = 'cash';
+    String? error;
+
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (_) => StatefulBuilder(
+        builder: (context, setLocal) => AlertDialog(
+          title: const Text('إضافة أصل / إيجار'),
+          content: SizedBox(
+            width: 420,
+            child: SingleChildScrollView(
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  TextField(
+                    controller: nameC,
+                    decoration: const InputDecoration(
+                        labelText: 'الاسم (مثال: إيجار المحل / فرن)'),
+                  ),
+                  const SizedBox(height: AppDimensions.space12),
+                  DropdownButtonFormField<String>(
+                    initialValue: category,
+                    decoration: const InputDecoration(labelText: 'النوع'),
+                    items: const [
+                      DropdownMenuItem(value: 'rent', child: Text('إيجار')),
+                      DropdownMenuItem(
+                          value: 'equipment', child: Text('معدات')),
+                      DropdownMenuItem(value: 'furniture', child: Text('أثاث')),
+                      DropdownMenuItem(
+                          value: 'other', child: Text('أصول أخرى')),
+                    ],
+                    onChanged: (v) => setLocal(() {
+                      category = v!;
+                      recurring = v == 'rent';
+                    }),
+                  ),
+                  const SizedBox(height: AppDimensions.space12),
+                  SwitchListTile(
+                    contentPadding: EdgeInsets.zero,
+                    value: recurring,
+                    onChanged: (v) => setLocal(() => recurring = v),
+                    title: const Text('مصروف متكرر شهريًا (زي الإيجار)'),
+                    subtitle: Text(
+                        recurring
+                            ? 'كل دفعة بتتخصم كاملة من ربح الشهر'
+                            : 'أصل بيتشترى مرة واحدة وبيتهلك على شهور',
+                        style: AppTypography.caption),
+                  ),
+                  TextField(
+                    controller: costC,
+                    keyboardType:
+                        const TextInputType.numberWithOptions(decimal: true),
+                    decoration: InputDecoration(
+                        labelText:
+                            recurring ? 'القيمة الشهرية' : 'التكلفة الكلية'),
+                  ),
+                  if (!recurring) ...[
+                    const SizedBox(height: AppDimensions.space12),
+                    TextField(
+                      controller: lifeC,
+                      keyboardType: TextInputType.number,
+                      decoration: const InputDecoration(
+                          labelText: 'مدة الإهلاك (بالشهور)'),
+                    ),
+                    const SizedBox(height: AppDimensions.space12),
+                    DropdownButtonFormField<String>(
+                      initialValue: paymentType,
+                      decoration:
+                          const InputDecoration(labelText: 'طريقة الدفع'),
+                      items: const [
+                        DropdownMenuItem(
+                            value: 'cash', child: Text('نقدي (من الدرج)')),
+                        DropdownMenuItem(value: 'credit', child: Text('آجل')),
+                      ],
+                      onChanged: (v) => setLocal(() => paymentType = v!),
+                    ),
+                  ],
+                  const SizedBox(height: AppDimensions.space12),
+                  TextField(
+                    controller: notesC,
+                    decoration: const InputDecoration(labelText: 'ملاحظات'),
+                  ),
+                  if (error != null) ...[
+                    const SizedBox(height: AppDimensions.space8),
+                    Text(error!,
+                        style: AppTypography.bodySmall
+                            .copyWith(color: AppColors.error)),
+                  ],
+                ],
+              ),
+            ),
+          ),
+          actions: [
+            TextButton(
+                onPressed: () => Navigator.pop(context, false),
+                child: const Text('إلغاء')),
+            FilledButton(
+              onPressed: () {
+                final cost = double.tryParse(costC.text.trim()) ?? 0;
+                if (nameC.text.trim().isEmpty || cost <= 0) {
+                  setLocal(() => error = 'اكتب الاسم وقيمة أكبر من صفر');
+                  return;
+                }
+                Navigator.pop(context, true);
+              },
+              child: const Text('حفظ'),
+            ),
+          ],
+        ),
+      ),
+    );
+    if (ok != true) return;
     await DatabaseHelper.instance.addFixedAsset(
-        name: nameCtrl.text.trim(),
-        category: category,
-        cost: cost,
-        isRecurring: isRecurring,
-        usefulLifeMonths: life,
-        userId: SessionService.instance.currentUser?.id);
+      name: nameC.text.trim(),
+      category: category,
+      cost: double.tryParse(costC.text.trim()) ?? 0,
+      isRecurring: recurring,
+      usefulLifeMonths: int.tryParse(lifeC.text.trim()),
+      paymentType: paymentType,
+      notes: notesC.text.trim().isEmpty ? null : notesC.text.trim(),
+    );
     _load();
   }
 
-  Widget _profitLossCard() {
-    if (_profitLoss == null) return const SizedBox.shrink();
-    final netProfit = (_profitLoss!['net_profit'] as num).toDouble();
-    final totalSales = (_profitLoss!['total_sales'] as num).toDouble();
-    final cogsTotal = (_profitLoss!['cogs_total'] as num).toDouble();
-    final expensesTotal = (_profitLoss!['expenses_total'] as num).toDouble();
-    final isProfit = netProfit >= 0;
-
-    return Container(
-      margin: const EdgeInsets.fromLTRB(AppDimensions.space24, 0,
-          AppDimensions.space24, AppDimensions.space16),
-      padding: const EdgeInsets.all(AppDimensions.space16),
-      decoration: BoxDecoration(
-        color: isProfit
-            ? AppColors.successLight
-            : AppColors.error.withValues(alpha: 0.08),
-        borderRadius: BorderRadius.circular(AppDimensions.radiusMd),
-        border: Border.all(
-          color: isProfit ? AppColors.success : AppColors.error,
+  Future<void> _payRecurring(Map<String, dynamic> asset) async {
+    final amountC = TextEditingController(text: '${asset['cost']}');
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (_) => AlertDialog(
+        title: Text('دفعة شهرية — ${asset['name']}'),
+        content: TextField(
+          controller: amountC,
+          keyboardType: const TextInputType.numberWithOptions(decimal: true),
+          decoration: const InputDecoration(labelText: 'المبلغ المدفوع'),
         ),
-      ),
-      child: Row(
-        children: [
-          Icon(
-            isProfit ? Icons.trending_up_rounded : Icons.trending_down_rounded,
-            color: isProfit ? AppColors.success : AppColors.error,
-            size: 28,
-          ),
-          const SizedBox(width: AppDimensions.space12),
-          Expanded(
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Text('صافي الربح (من بداية النشاط)',
-                    style: AppTypography.bodySmall),
-                Text(
-                  '${netProfit.toStringAsFixed(2)} ج.م',
-                  style: AppTypography.headlineSmall.copyWith(
-                    color: isProfit ? AppColors.success : AppColors.error,
-                    fontWeight: FontWeight.w800,
-                  ),
-                ),
-                const SizedBox(height: 4),
-                Text(
-                  'مبيعات ${totalSales.toStringAsFixed(0)} ج.م  •  '
-                  'تكلفة بضاعة ${cogsTotal.toStringAsFixed(0)} ج.م  •  '
-                  'مصاريف ${expensesTotal.toStringAsFixed(0)} ج.م',
-                  style: AppTypography.caption
-                      .copyWith(color: AppColors.textSecondary),
-                ),
-              ],
-            ),
-          ),
+        actions: [
+          TextButton(
+              onPressed: () => Navigator.pop(context, false),
+              child: const Text('إلغاء')),
+          FilledButton(
+              onPressed: () => Navigator.pop(context, true),
+              child: const Text('تسجيل الدفعة')),
         ],
       ),
     );
+    final amount = double.tryParse(amountC.text.trim()) ?? 0;
+    if (ok != true || amount <= 0) return;
+    await DatabaseHelper.instance.payRecurringAsset(
+        assetId: asset['id'] as String, amountOverride: amount);
+    _load();
   }
 
-  Widget _assetsSection() {
-    if (_assets.isEmpty) return const SizedBox.shrink();
-    return Padding(
-      padding: const EdgeInsets.fromLTRB(AppDimensions.space24, 0,
-          AppDimensions.space24, AppDimensions.space16),
-      child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-        Text('الأصول والمصاريف الثابتة', style: AppTypography.titleMedium),
-        const SizedBox(height: AppDimensions.space10),
-        ..._assets.map((asset) {
-          final isRecurring = (asset['is_recurring'] as int) == 1;
-          final cost = (asset['cost'] as num).toDouble();
-          final accumulated =
-              (asset['accumulated_depreciation'] as num?)?.toDouble() ?? 0;
-          final remaining = cost - accumulated;
-
-          return Container(
-            margin: const EdgeInsets.only(bottom: 8),
-            padding: const EdgeInsets.all(AppDimensions.space12),
-            decoration: BoxDecoration(
-              color: AppColors.surface,
-              borderRadius: BorderRadius.circular(AppDimensions.radiusSm),
-              border: Border.all(color: AppColors.border),
-            ),
-            child: Row(children: [
-              Icon(
-                  isRecurring
-                      ? Icons.repeat_rounded
-                      : Icons.inventory_2_outlined,
-                  color: AppColors.primary),
-              const SizedBox(width: 10),
-              Expanded(
-                child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      Text(asset['name'] as String,
-                          style: AppTypography.titleSmall),
-                      Text(
-                        isRecurring
-                            ? 'متكرر شهريًا — ${cost.toStringAsFixed(0)} ج.م/شهر'
-                            : 'مُهلَك: ${accumulated.toStringAsFixed(0)} من ${cost.toStringAsFixed(0)} ج.م '
-                                '(متبقي ${remaining.toStringAsFixed(0)})',
-                        style: AppTypography.caption
-                            .copyWith(color: AppColors.textSecondary),
-                      ),
-                    ]),
-              ),
-              if (isRecurring)
-                TextButton.icon(
-                  onPressed: () async {
-                    await DatabaseHelper.instance.payRecurringAsset(
-                        assetId: asset['id'] as String,
-                        userId: SessionService.instance.currentUser?.id);
-                    _load();
-                  },
-                  icon: const Icon(Icons.add_card_outlined, size: 18),
-                  label: const Text('تسجيل دفعة الشهر'),
-                ),
-            ]),
-          );
-        }),
-      ]),
-    );
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    return Scaffold(
-      appBar: AppTopBar(
-        title: 'دليل الحسابات',
-        action: Row(mainAxisSize: MainAxisSize.min, children: [
-          IconButton(
-              tooltip: 'إضافة أصل ثابت',
-              onPressed: _addAssetDialog,
-              icon: const Icon(Icons.add_business_rounded)),
-          IconButton(
-              tooltip: 'تحديث',
-              onPressed: _load,
-              icon: const Icon(Icons.refresh_rounded)),
-        ]),
+  Future<void> _deleteAsset(Map<String, dynamic> asset) async {
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (_) => AlertDialog(
+        title: const Text('حذف الأصل'),
+        content: Text(
+            'هتحذف "${asset['name']}"؟ لو كان أصل نقدي، مبلغ شرائه هيرجع للدرج الأساسي في الحساب. المصاريف اللي اتسجلت قبل كده (إهلاك/دفعات إيجار) هتفضل زي ما هي.'),
+        actions: [
+          TextButton(
+              onPressed: () => Navigator.pop(context, false),
+              child: const Text('إلغاء')),
+          FilledButton(
+              style: FilledButton.styleFrom(backgroundColor: AppColors.error),
+              onPressed: () => Navigator.pop(context, true),
+              child: const Text('حذف')),
+        ],
       ),
-      body: _loading
-          ? const Center(child: CircularProgressIndicator())
-          : SingleChildScrollView(
-              child: Column(
-                children: [
-                  Padding(
-                    padding: const EdgeInsets.fromLTRB(
-                        AppDimensions.space24,
-                        AppDimensions.space20,
-                        AppDimensions.space24,
-                        AppDimensions.space8),
-                    child: LayoutBuilder(
-                      builder: (context, constraints) {
-                        final columns = constraints.maxWidth > 900 ? 3 : 1;
-                        return GridView.count(
-                          crossAxisCount: columns,
-                          crossAxisSpacing: AppDimensions.space12,
-                          mainAxisSpacing: AppDimensions.space12,
-                          childAspectRatio: columns == 1 ? 5.5 : 2.8,
-                          shrinkWrap: true,
-                          physics: const NeverScrollableScrollPhysics(),
-                          children: [
-                            _AccountSummary(
-                                label: 'الأصول',
-                                value: _sumByType('asset'),
-                                color: AppColors.primary),
-                            _AccountSummary(
-                                label: 'الإيرادات',
-                                value: _sumByType('revenue'),
-                                color: AppColors.success),
-                            _AccountSummary(
-                                label: 'المصروفات',
-                                value: _sumByType('expense'),
-                                color: AppColors.warning),
-                          ],
-                        );
-                      },
-                    ),
-                  ),
-                  _profitLossCard(),
-                  _assetsSection(),
-                  /*     ListView.separated(
-                    shrinkWrap: true,
-                    physics: const NeverScrollableScrollPhysics(),
-                    padding: const EdgeInsets.symmetric(
-                        horizontal: AppDimensions.space24),
-                    itemCount: _orderedAccounts.length,
-                    separatorBuilder: (_, __) => const Divider(height: 1),
-                    itemBuilder: (_, index) {
-                      final account = _orderedAccounts[index];
-                      final level = account['_level'] as int;
-                      return ListTile(
-                        contentPadding:
-                            EdgeInsets.only(left: 8, right: 8 + level * 24.0),
-                        leading: Icon(
-                          level == 0
-                              ? Icons.account_tree_rounded
-                              : Icons.subdirectory_arrow_left_rounded,
-                          color: level == 0
-                              ? AppColors.primary
-                              : AppColors.textSecondary,
-                        ),
-                        title: Text(account['name'] as String,
-                            style: level == 0
-                                ? AppTypography.titleMedium
-                                : AppTypography.bodyMedium),
-                        subtitle: Text(
-                            '${account['code']} • ${_typeLabel(account['type'] as String)}',
-                            style: AppTypography.bodySmall),
-                        trailing: Text(
-                            '${(account['balance'] as num).abs().toStringAsFixed(2)} ج.م',
-                            style: AppTypography.titleSmall.copyWith(
-                              color: account['type'] == 'revenue'
-                                  ? AppColors.success
-                                  : AppColors.textPrimary,
-                            )),
-                        onTap: () => _showTransactions(account),
-                      );
-                    },
-                  ),*/
-                  const SizedBox(height: AppDimensions.space24),
-                ],
-              ),
-            ),
     );
+    if (ok != true) return;
+    await DatabaseHelper.instance.deleteFixedAsset(asset['id'] as String);
+    _load();
   }
-}
 
-class _AccountSummary extends StatelessWidget {
-  const _AccountSummary(
-      {required this.label, required this.value, required this.color});
-
-  final String label;
-  final double value;
-  final Color color;
-
-  @override
-  Widget build(BuildContext context) {
+  // ─── منطقة الخطر: حذف كل البيانات ────────────────
+  Widget _dangerSection() {
     return Container(
-      padding: const EdgeInsets.all(AppDimensions.space12),
+      width: double.infinity,
+      padding: const EdgeInsets.all(AppDimensions.space16),
       decoration: BoxDecoration(
         color: AppColors.surface,
         borderRadius: BorderRadius.circular(AppDimensions.radiusMd),
-        border: Border.all(color: AppColors.border),
+        border: Border.all(color: AppColors.error),
       ),
       child: Row(
         children: [
-          Icon(Icons.account_balance_wallet_outlined, color: color),
-          const SizedBox(width: AppDimensions.space8),
-          Text(label, style: AppTypography.bodySmall),
-          const Spacer(),
-          Text('${value.toStringAsFixed(2)} ج.م',
-              style: AppTypography.titleSmall.copyWith(color: color)),
+          Icon(Icons.warning_amber_rounded, color: AppColors.error),
+          const SizedBox(width: AppDimensions.space12),
+          Expanded(
+            child: Text(
+                'حذف كل البيانات وتصفير الحسابات (بياخد نسخة احتياطية الأول)',
+                style: AppTypography.bodyMedium),
+          ),
+          FilledButton.icon(
+            style: FilledButton.styleFrom(backgroundColor: AppColors.error),
+            onPressed: _resetAll,
+            icon: const Icon(Icons.delete_forever_rounded),
+            label: const Text('حذف كل حاجة'),
+          ),
         ],
       ),
+    );
+  }
+
+  Future<void> _resetAll() async {
+    bool includeMaster = false;
+    final confirmC = TextEditingController();
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (_) => StatefulBuilder(
+        builder: (context, setLocal) => AlertDialog(
+          title: Row(
+            children: [
+              Icon(Icons.warning_amber_rounded, color: AppColors.error),
+              const SizedBox(width: AppDimensions.space8),
+              const Text('حذف كل البيانات'),
+            ],
+          ),
+          content: SizedBox(
+            width: 440,
+            child: SingleChildScrollView(
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                      'هيتحذف: كل الأوردرات والمصاريف والشيفتات وحركات الدرج الأساسي والمشتريات وسداد الموردين وحركات الموظفين وحركات المخزون والجرد والأصول الثابتة، وكل الأرصدة هتتصفّر.',
+                      style: AppTypography.bodyMedium),
+                  const SizedBox(height: AppDimensions.space8),
+                  Text('هيفضل: المستخدمين والإعدادات.',
+                      style: AppTypography.bodySmall),
+                  CheckboxListTile(
+                    contentPadding: EdgeInsets.zero,
+                    value: includeMaster,
+                    onChanged: (v) =>
+                        setLocal(() => includeMaster = v ?? false),
+                    title: const Text(
+                        'احذف كمان الأصناف والتصنيفات والخامات والوصفات والموردين والعملاء والموظفين'),
+                  ),
+                  Text('هيتاخد نسخة احتياطية من قاعدة البيانات قبل الحذف.',
+                      style: AppTypography.caption),
+                  const SizedBox(height: AppDimensions.space12),
+                  TextField(
+                    controller: confirmC,
+                    onChanged: (_) => setLocal(() {}),
+                    decoration: const InputDecoration(
+                        labelText: 'اكتب كلمة "حذف" للتأكيد'),
+                  ),
+                ],
+              ),
+            ),
+          ),
+          actions: [
+            TextButton(
+                onPressed: () => Navigator.pop(context, false),
+                child: const Text('إلغاء')),
+            FilledButton(
+              style: FilledButton.styleFrom(backgroundColor: AppColors.error),
+              onPressed: confirmC.text.trim() == 'حذف'
+                  ? () => Navigator.pop(context, true)
+                  : null,
+              child: const Text('احذف كل حاجة'),
+            ),
+          ],
+        ),
+      ),
+    );
+    if (ok != true) return;
+
+    setState(() => _loading = true);
+    String message;
+    try {
+      final db = DatabaseHelper.instance;
+      final backup = await db.backupDatabase(); // لو فشلت مفيش حاجة بتتحذف
+      await db.resetAllData(includeMasterData: includeMaster);
+      message = 'تم الحذف. النسخة الاحتياطية: $backup';
+    } catch (e) {
+      message = 'حصل خطأ ومفيش حاجة اتحذفت: $e';
+    }
+    await _load();
+    if (!mounted) return;
+    ScaffoldMessenger.of(context)
+        .showSnackBar(SnackBar(content: Text(message)));
+  }
+
+  // ─── 4) الموردين ─────────────────────────────────
+  Widget _suppliersSection() {
+    final suppliers =
+        (_o['suppliers'] as List?)?.cast<Map<String, dynamic>>() ?? [];
+    return _section('ديون الموردين (علينا)', Icons.local_shipping_outlined, [
+      _row('إجمالي الدين', _n(_o, 'suppliers_debt'),
+          bold: true, color: AppColors.error),
+      if (suppliers.isEmpty)
+        Text('مفيش ديون على الموردين', style: AppTypography.bodySmall),
+      for (final s in suppliers)
+        _row(s['name'] as String, s['balance'] as num, indent: 12),
+    ]);
+  }
+
+  // ─── 5) المخزون والأصول ──────────────────────────
+  Widget _assetsSection() {
+    final total = _n(_o, 'raw_stock_value') +
+        _n(_o, 'product_stock_value') +
+        _n(_o, 'fixed_assets_value');
+    return _section('المخزون والأصول', Icons.inventory_2_outlined, [
+      _row('مخزون الخامات', _n(_o, 'raw_stock_value')),
+      _row('مخزون الأصناف', _n(_o, 'product_stock_value')),
+      _row('الأصول الثابتة (بعد الإهلاك)', _n(_o, 'fixed_assets_value')),
+      const Divider(),
+      _row('الإجمالي', total, bold: true, color: AppColors.primary),
+    ]);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    const gap = SizedBox(height: AppDimensions.space16);
+    return Scaffold(
+      appBar: AppTopBar(
+        title: 'الحسابات',
+        action: IconButton(
+          tooltip: 'تحديث',
+          onPressed: _load,
+          icon: const Icon(Icons.refresh_rounded),
+        ),
+      ),
+      body: _loading
+          ? const Center(child: CircularProgressIndicator())
+          : ListView(
+              padding: const EdgeInsets.all(AppDimensions.space24),
+              children: [
+                _treasurySection(),
+                gap,
+                _shiftSection(),
+                gap,
+                Text('تقارير الفترة', style: AppTypography.titleLarge),
+                const SizedBox(height: AppDimensions.space8),
+                _filterBar(),
+                gap,
+                _paymentMethodsSection(),
+                gap,
+                _afterExpensesSection(),
+                gap,
+                _profitSection(),
+                gap,
+                _suppliersSection(),
+                gap,
+                _assetsSection(),
+                gap,
+                _fixedAssetsSection(),
+                gap,
+                _dangerSection(),
+              ],
+            ),
     );
   }
 }

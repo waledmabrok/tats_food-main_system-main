@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:system_casher/features/cashier/presentation/screens/receive_purchase_dialog.dart';
 import '../../../../core/constants/app_strings.dart';
 import '../../../../core/database/database_helper.dart';
 import '../../../../core/theme/app_colors.dart';
@@ -14,9 +15,11 @@ import '../../../../repositories/order_repository.dart';
 import '../../../../repositories/product_repository.dart';
 import '../../../../core/services/printing_service.dart';
 import '../../../../core/services/session_service.dart';
+import '../../../auth/presentation/screens/login_screen.dart';
 import '../../../products/presentation/screens/products_screen.dart';
 import 'add_expense_dialog.dart';
 import 'my_orders_screen.dart';
+import 'close_shift_dialog.dart';
 
 // ─── عنصر في السلة ────────────────────────────────────────────────────────
 class _CartItem {
@@ -40,7 +43,7 @@ class _CashierScreenState extends State<CashierScreen> {
   final _categoryRepo = CategoryRepository();
   final _orderRepo = OrderRepository();
   final ScrollController _scrollController = ScrollController();
-
+  bool _canCloseShift = false;
   List<Product> _products = [];
   List<Category> _categories = [];
   final List<_CartItem> _cart = [];
@@ -71,6 +74,9 @@ class _CashierScreenState extends State<CashierScreen> {
   @override
   void initState() {
     super.initState();
+    DatabaseHelper.instance.getSetting('cashier_can_close_shift').then((v) {
+      if (mounted) setState(() => _canCloseShift = v == '1');
+    });
     _scrollController.addListener(_onScroll);
     _loadInitialData();
   }
@@ -351,6 +357,21 @@ class _CashierScreenState extends State<CashierScreen> {
     }
   }
 
+  Future<void> _closeShift() async {
+    final closed = await showDialog<bool>(
+      context: context,
+      barrierDismissible: false,
+      builder: (_) => const CloseShiftDialog(),
+    );
+    if (closed != true || !mounted) return;
+
+    SessionService.instance.logout();
+    Navigator.of(context).pushAndRemoveUntil(
+      MaterialPageRoute(builder: (_) => const LoginScreen()),
+      (route) => false,
+    );
+  }
+
   void _showSuccessDialog(Order order) {
     showDialog(
       context: context,
@@ -568,6 +589,28 @@ class _CashierScreenState extends State<CashierScreen> {
         action: Row(
           mainAxisSize: MainAxisSize.min,
           children: [
+            if (_canCloseShift)
+              IconButton(
+                tooltip: 'قفل الشيفت',
+                onPressed: _closeShift,
+                icon: const Icon(Icons.lock_clock_rounded),
+              ),
+            IconButton(
+              tooltip: 'استلام بضاعة',
+              onPressed: () async {
+                final saved = await showDialog<bool>(
+                  context: context,
+                  builder: (_) => const ReceivePurchaseDialog(),
+                );
+                if (saved == true && mounted) {
+                  _loadInitialData(); // عشان مخزون الأصناف الجاهزة يتحدّث
+                  ScaffoldMessenger.of(context).showSnackBar(
+                    const SnackBar(content: Text('تم تسجيل استلام البضاعة')),
+                  );
+                }
+              },
+              icon: const Icon(Icons.local_shipping_outlined),
+            ),
             IconButton(
               tooltip: 'إضافة مصروف',
               onPressed: () async {

@@ -65,10 +65,24 @@ class _LoginScreenState extends State<LoginScreen> {
       if (!mounted) return;
 
       if (user != null) {
-        SessionService.instance.login(user);
-        // فتح شيفت تلقائي للكاشير بس — مش للأدمن/المالك
-        if (user.role == 'cashier') {
-          final currentShift = await DatabaseHelper.instance.getCurrentShift();
+        final isCashier = user.role.name == 'cashier';
+        final currentShift = await DatabaseHelper.instance.getCurrentShift();
+        debugPrint(
+            'LOGIN user=${user.name} role=${user.role.name} id=${user.id} '
+            'shiftUser=${currentShift?['user_id']}');
+
+        if (isCashier) {
+          if (currentShift != null && currentShift['user_id'] != user.id) {
+            final otherName =
+                currentShift['user_name'] as String? ?? 'مستخدم آخر';
+            setState(() {
+              _errorMsg =
+                  'فيه شيفت مفتوح على "$otherName". لازم الأدمن يقفله الأول.';
+              _isLoading = false;
+            });
+            _pinCtrl.clear();
+            return;
+          }
           if (currentShift == null) {
             await DatabaseHelper.instance.openShift(
               userId: user.id,
@@ -77,7 +91,8 @@ class _LoginScreenState extends State<LoginScreen> {
             );
           }
         }
-        // الانتقال إلى AppShell وإزالة LoginScreen من الـ Stack
+
+        SessionService.instance.login(user);
         if (!mounted) return;
         Navigator.of(context).pushReplacement(
           MaterialPageRoute(builder: (_) => AppShell(user: user)),

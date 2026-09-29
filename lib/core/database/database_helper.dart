@@ -11,7 +11,7 @@ class DatabaseHelper {
   static final DatabaseHelper instance = DatabaseHelper._();
 
   static Database? _db;
-  static const int _version = 7;
+  static const int _version = 9;
   static const String _dbName = 'foodpro.db';
   static const _uuid = Uuid();
 
@@ -53,6 +53,8 @@ class DatabaseHelper {
     await _upgradeToV5(db);
     await _upgradeToV6(db);
     await _upgradeToV7(db);
+    await _upgradeToV8(db);
+    await _upgradeToV9(db);
   }
 
   Future<void> _onUpgrade(Database db, int oldVersion, int newVersion) async {
@@ -73,6 +75,12 @@ class DatabaseHelper {
     }
     if (oldVersion < 7) {
       await _upgradeToV7(db);
+    }
+    if (oldVersion < 8) {
+      await _upgradeToV8(db);
+    } // في _onUpgrade
+    if (oldVersion < 9) {
+      await _upgradeToV9(db);
     }
   }
 
@@ -184,6 +192,28 @@ class DatabaseHelper {
     }
   }
 
+  Future<void> _upgradeToV8(Database db) async {
+    await db.execute('''
+    CREATE TABLE IF NOT EXISTS treasury_movements (
+      id         TEXT PRIMARY KEY,
+      type       TEXT NOT NULL, -- 'deposit' | 'withdraw'
+      amount     REAL NOT NULL,
+      notes      TEXT,
+      user_id    TEXT,
+      created_at TEXT NOT NULL
+    )
+  ''');
+  }
+
+  Future<void> _upgradeToV9(Database db) async {
+    try {
+      await db.execute(
+          "ALTER TABLE treasury_movements ADD COLUMN method TEXT NOT NULL DEFAULT 'cash'");
+    } catch (_) {
+      // العمود موجود بالفعل
+    }
+  }
+
   // ═══════════════════════════════════════════════════════════════
   // إنشاء قاعدة البيانات من الصفر
   // ═══════════════════════════════════════════════════════════════
@@ -193,6 +223,8 @@ class DatabaseHelper {
     await _upgradeToV7(db);
     await _seedData(db);
     await _seedDefaultChartOfAccounts(db);
+    await _upgradeToV8(db);
+    await _upgradeToV9(db);
   }
 
   Future<void> _createCoreTables(Database db) async {
@@ -2080,10 +2112,24 @@ class DatabaseHelper {
       'remaining': remaining,
     };
   }
+
 // ═══════════════════════════════════════════════════════════════
 // 6) أوردرات الكاشير + سجل التعديلات (Audit Log)
 // ═══════════════════════════════════════════════════════════════
-
+  /// أوردرات شيفت معين (الأحدث الأول)
+  Future<List<Map<String, dynamic>>> getOrdersByShift(
+    String shiftId, {
+    int? limit,
+    int? offset,
+  }) =>
+      query(
+        'orders',
+        where: 'shift_id = ?',
+        whereArgs: [shiftId],
+        orderBy: 'created_at DESC',
+        limit: limit,
+        offset: offset,
+      );
   Future<List<Map<String, dynamic>>> getOrdersByUser(
     String userId, {
     int? limit,
@@ -2300,6 +2346,433 @@ class DatabaseHelper {
 // ═══════════════════════════════════════════════════════════════
 // 7) مصروف سريع أثناء الشيفت
 // ═══════════════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════════
+// ضيف الدالة دي جوه كلاس DatabaseHelper (مثلًا بعد getProfitLossReport)
+// ═══════════════════════════════════════════════════════════════
+
+  Future<void> addTreasuryMovement({
+    required String type, // deposit | withdraw
+    required double amount,
+    String method = 'cash', // cash | vodafone | card | other
+    String? notes,
+    String? userId,
+  }) async {
+    await insert('treasury_movements', {
+      'id': generateId(),
+      'type': type,
+      'amount': amount,
+      'method': method,
+      'notes': notes,
+      'user_id': userId,
+      'created_at': DateTime.now().toIso8601String(),
+    });
+  }
+
+  Future<List<Map<String, dynamic>>> getTreasuryMovements({int limit = 15}) =>
+      query('treasury_movements', orderBy: 'created_at DESC', limit: limit);
+
+  Future<double> _sumQuery(String sql, [List<dynamic>? args]) async {
+    final rows = await rawQuery(sql, args);
+    return (rows.first['v'] as num?)?.toDouble() ?? 0;
+  }
+
+  /// رصيد الدرج الأساسي (الخزينة) — تراكمي من أول ما السيستم اشتغل، مش مرتبط بشيفت
+  ///
+  /// داخل:  مبيعات كاش + إيداعات + زيادة الشيفتات
+  /// خارج:  مصاريف نقدية + مشتريات نقدية + سداد موردين + رواتب وسلف
+  ///        + شراء أصول نقدي + سحوبات + عجز الشيفتات
+  /// (الإهلاك مش فلوس خارجة، والفيزا/الشبكة مش بتدخل الدرج)
+  Future<Map<String, dynamic>> getTreasuryOverview() async {
+    final cashSales = await _sumQuery('''
+    SELECT COALESCE(SUM(final_amount), 0) AS v FROM orders
+    WHERE status = 'completed' AND payment_method = 'cash'
+  ''');
+    final deposits = await _sumQuery(
+        "SELECT COALESCE(SUM(amount), 0) AS v FROM treasury_movements WHERE type = 'deposit' AND method = 'cash'");
+    final withdrawals = await _sumQuery(
+        "SELECT COALESCE(SUM(amount), 0) AS v FROM treasury_movements WHERE type = 'withdraw' AND method = 'cash'");
+    // فرق الشيفتات المقفولة (فعلي − متوقع): موجب = زيادة، سالب = عجز
+    final shiftDiff = await _sumQuery('''
+    SELECT COALESCE(SUM(closing_cash - expected_cash), 0) AS v FROM shifts
+    WHERE status = 'closed' AND closing_cash IS NOT NULL AND expected_cash IS NOT NULL
+  ''');
+
+    final expensesCash = await _sumQuery('''
+    SELECT COALESCE(SUM(amount), 0) AS v FROM expenses
+    WHERE category NOT IN ('إهلاك أصول', '$_salaryCategory', $_supplierCatsSql)
+  ''');
+    final payroll = await _sumQuery(
+        "SELECT COALESCE(SUM(amount), 0) AS v FROM expenses WHERE category = '$_salaryCategory'");
+    final supplierExpenses = await _sumQuery(
+        "SELECT COALESCE(SUM(amount), 0) AS v FROM expenses WHERE category IN ($_supplierCatsSql)");
+
+    final assetsCash = await _sumQuery('''
+    SELECT COALESCE(SUM(cost), 0) AS v FROM fixed_assets
+    WHERE is_recurring = 0 AND payment_type = 'cash'
+  ''');
+
+    final purchasesPaidAtReceipt = await _sumQuery('''
+    SELECT COALESCE(SUM(x.initial_paid), 0) AS v FROM (
+      SELECT pi.created_at, pi.total_amount,
+        pi.paid_amount - COALESCE(
+          (SELECT SUM(sp.amount) FROM supplier_payments sp WHERE sp.invoice_id = pi.id), 0
+        ) AS initial_paid
+      FROM purchase_invoices pi
+    ) x
+    WHERE x.initial_paid > 0 AND NOT EXISTS (
+      SELECT 1 FROM expenses e
+      WHERE e.category IN ($_supplierCatsSql)
+        AND substr(e.date, 1, 10) = substr(x.created_at, 1, 10)
+        AND (ABS(e.amount - x.initial_paid) < 0.005
+             OR ABS(e.amount - x.total_amount) < 0.005)
+    )
+  ''');
+    final supplierPayments = await _sumQuery('''
+    SELECT COALESCE(SUM(sp.amount), 0) AS v FROM supplier_payments sp
+    WHERE sp.payment_method = 'cash' AND NOT EXISTS (
+      SELECT 1 FROM expenses e
+      WHERE e.category IN ($_supplierCatsSql)
+        AND ABS(e.amount - sp.amount) < 0.005
+        AND substr(e.date, 1, 10) = substr(sp.created_at, 1, 10)
+    )
+  ''');
+    final purchasesTotal =
+        supplierExpenses + purchasesPaidAtReceipt + supplierPayments;
+
+    final totalIn = cashSales + deposits + (shiftDiff > 0 ? shiftDiff : 0);
+    final totalOut = expensesCash +
+        assetsCash +
+        purchasesTotal +
+        payroll +
+        withdrawals +
+        (shiftDiff < 0 ? -shiftDiff : 0);
+
+    // ── أرصدة الطرق الغير كاش (فيزا / فودافون / أخرى) ──
+    final salesByMethod = await rawQuery('''
+      SELECT payment_method AS method, COALESCE(SUM(final_amount), 0) AS total
+      FROM orders WHERE status = 'completed' AND payment_method != 'cash'
+      GROUP BY payment_method
+    ''');
+    final movByMethod = await rawQuery('''
+      SELECT method, type, COALESCE(SUM(amount), 0) AS total
+      FROM treasury_movements WHERE method != 'cash'
+      GROUP BY method, type
+    ''');
+    final balances = <String, double>{};
+    for (final r in salesByMethod) {
+      final m = r['method'] as String;
+      balances[m] = (balances[m] ?? 0) + (r['total'] as num).toDouble();
+    }
+    for (final r in movByMethod) {
+      final m = r['method'] as String;
+      final t = (r['total'] as num).toDouble();
+      balances[m] = (balances[m] ?? 0) + (r['type'] == 'deposit' ? t : -t);
+    }
+    final methodBalances = balances.entries
+        .map((e) => {'method': e.key, 'balance': e.value})
+        .toList();
+
+    return {
+      'balance': totalIn - totalOut,
+      'cash_sales': cashSales,
+      'deposits': deposits,
+      'shift_diff': shiftDiff,
+      'expenses_cash': expensesCash,
+      'assets_cash': assetsCash,
+      'purchases_cash': purchasesTotal,
+      'payroll': payroll,
+      'withdrawals': withdrawals,
+      'total_in': totalIn,
+      'total_out': totalOut,
+      'method_balances': methodBalances,
+    };
+  }
+
+  /// ملخص الفترة (من/إلى اختياري) + الديون + المخزون + الأصول + الشيفتات
+  Future<Map<String, dynamic>> getAccountsOverview({
+    DateTime? from,
+    DateTime? to,
+  }) async {
+    final end = to == null
+        ? null
+        : DateTime(to.year, to.month, to.day, 23, 59, 59, 999);
+    final fromStr = (from ?? DateTime(2000)).toIso8601String();
+    final toStr = (end ?? DateTime.now()).toIso8601String();
+
+    final pl = await getProfitLossReport(from: from, to: end);
+
+    // الرواتب والسلف: مسجلة كمصروف بنوع '$_salaryCategory' فبتتعد من هنا مرة واحدة
+    final payroll = await _sumQuery('''
+    SELECT COALESCE(SUM(amount), 0) AS v FROM expenses
+    WHERE category = '$_salaryCategory' AND date BETWEEN ? AND ?
+  ''', [fromStr, toStr]);
+
+    // باقي المصاريف (من غير الرواتب، ومن غير مشتريات الموردين لأن تكلفتها في تكلفة البضاعة)
+    final expRows = await rawQuery('''
+    SELECT category, COALESCE(SUM(amount), 0) AS total FROM expenses
+    WHERE date BETWEEN ? AND ?
+      AND category NOT IN ('$_salaryCategory', $_supplierCatsSql)
+    GROUP BY category
+  ''', [fromStr, toStr]);
+    double expensesTotal = 0;
+    final expensesByCategory = <String, double>{};
+    for (final r in expRows) {
+      final t = (r['total'] as num).toDouble();
+      expensesTotal += t;
+      expensesByCategory[r['category'] as String] = t;
+    }
+    final excludedDuplicates = await _sumQuery('''
+    SELECT COALESCE(SUM(amount), 0) AS v FROM expenses
+    WHERE category IN ($_supplierCatsSql) AND date BETWEEN ? AND ?
+  ''', [fromStr, toStr]);
+
+    final methodRows = await rawQuery('''
+    SELECT payment_method, COUNT(*) AS cnt, COALESCE(SUM(final_amount), 0) AS total
+    FROM orders WHERE status = 'completed' AND created_at BETWEEN ? AND ?
+    GROUP BY payment_method
+  ''', [fromStr, toStr]);
+    final mvRows = await rawQuery('''
+  SELECT method, type, COALESCE(SUM(amount), 0) AS total
+  FROM treasury_movements
+  WHERE created_at BETWEEN ? AND ?
+  GROUP BY method, type
+''', [fromStr, toStr]);
+    final movementsByMethod = <String, double>{};
+    for (final r in mvRows) {
+      final m = r['method'] as String;
+      final t = (r['total'] as num).toDouble();
+      movementsByMethod[m] =
+          (movementsByMethod[m] ?? 0) + (r['type'] == 'deposit' ? t : -t);
+    }
+    double cash = 0, card = 0, other = 0;
+    for (final r in methodRows) {
+      final t = (r['total'] as num).toDouble();
+      final m = r['payment_method'] as String;
+      if (m == 'cash') {
+        cash += t;
+      } else if (m == 'card' || m == 'visa') {
+        card += t;
+      } else {
+        other += t;
+      }
+    }
+
+    final suppliers = await rawQuery(
+        'SELECT name, balance FROM suppliers WHERE balance > 0 ORDER BY balance DESC');
+    final suppliersDebt = suppliers.fold<double>(
+        0, (s, r) => s + (r['balance'] as num).toDouble());
+
+    final rawStockValue = await _sumQuery(
+        'SELECT COALESCE(SUM(MAX(stock, 0) * cost_per_unit), 0) AS v FROM raw_materials WHERE is_active = 1');
+    final productStockValue = await _sumQuery(
+        'SELECT COALESCE(SUM(MAX(stock, 0) * COALESCE(cost, 0)), 0) AS v FROM products WHERE is_active = 1');
+    final fixedAssetsValue = await _sumQuery(
+        'SELECT COALESCE(SUM(cost - accumulated_depreciation), 0) AS v FROM fixed_assets WHERE is_recurring = 0');
+
+    // الشيفتات
+    final openShift = await getCurrentShift();
+    double? shiftDrawer;
+    if (openShift != null) {
+      final s = await getShiftSummary(openShift['id'] as String);
+      shiftDrawer = (s['expected_drawer_cash'] as num).toDouble();
+    }
+    final lastClosed = await query('shifts',
+        where: 'status = ?',
+        whereArgs: ['closed'],
+        orderBy: 'closed_at DESC',
+        limit: 1);
+    final last = lastClosed.isEmpty ? null : lastClosed.first;
+
+    final netProfit = (pl['gross_profit'] as double) - expensesTotal - payroll;
+
+    return {
+      'total_sales': pl['total_sales'],
+      'orders_count': pl['orders_count'],
+      'cash_sales': cash,
+      'card_sales': card,
+      'other_sales': other,
+      'sales_by_method': methodRows
+          .map((r) => {
+                'method': r['payment_method'],
+                'total': r['total'],
+                'cnt': r['cnt'],
+              })
+          .toList(),
+      'cogs_total': pl['cogs_total'],
+      'gross_profit': pl['gross_profit'],
+      'expenses_total': expensesTotal,
+      'expenses_by_category': expensesByCategory,
+      'excluded_duplicates': excludedDuplicates,
+      'payroll': payroll,
+      'net_profit': netProfit,
+      'suppliers': suppliers,
+      'suppliers_debt': suppliersDebt,
+      'raw_stock_value': rawStockValue,
+      'product_stock_value': productStockValue,
+      'fixed_assets_value': fixedAssetsValue,
+      'has_open_shift': openShift != null,
+      'shift_drawer': shiftDrawer,
+      'last_closing_cash': (last?['closing_cash'] as num?)?.toDouble(),
+      'last_closing_at': last?['closed_at'] as String?,
+      'last_closing_user': last?['user_name'] as String?,
+      'movements_by_method': movementsByMethod,
+    };
+  }
+
+// ═══════════════════════════════════════════════════════════════
+// منع التكرار: الرواتب والمشتريات بتتسجل تلقائيًا كمصروف، فبنعدها من جدول expenses بس
+// (حطهم جوه كلاس DatabaseHelper)
+// ═══════════════════════════════════════════════════════════════
+
+  /// أسماء أنواع المصاريف اللي الشاشات بتسجلها تلقائيًا (لازم تطابق اللي عندك بالظبط)
+  static const String _salaryCategory = 'رواتب وسلف موظفين';
+
+  /// أنواع المصاريف اللي بتسجلها شاشات الموردين (استلام بضاعة + سداد مورد)
+  static const List<String> _supplierCategories = [
+    'مشتريات من موردين',
+    'سداد مورد',
+  ];
+  static final String _supplierCatsSql =
+      _supplierCategories.map((c) => "'$c'").join(', ');
+
+  /// كل المصاريف في الفترة (مع علامة على اللي مستبعد من الأرباح لأنه دفعة مورد)
+  Future<List<Map<String, dynamic>>> getExpensesList({
+    DateTime? from,
+    DateTime? to,
+  }) async {
+    final end = to == null
+        ? null
+        : DateTime(to.year, to.month, to.day, 23, 59, 59, 999);
+    final rows = await rawQuery('''
+    SELECT e.category, e.description, e.amount, e.date,
+           CASE WHEN e.category IN ($_supplierCatsSql) THEN 1 ELSE 0 END AS excluded
+    FROM expenses e
+    WHERE e.date BETWEEN ? AND ?
+    ORDER BY e.date DESC LIMIT 500
+  ''', [
+      (from ?? DateTime(2000)).toIso8601String(),
+      (end ?? DateTime.now()).toIso8601String(),
+    ]);
+    return rows.map((r) => {...r, 'excluded': r['excluded'] == 1}).toList();
+  }
+
+// ═══════════════════════════════════════════════════════════════
+// نسخة احتياطية + حذف كل البيانات (حطهم جوه كلاس DatabaseHelper)
+// ═══════════════════════════════════════════════════════════════
+
+  /// ينسخ ملف قاعدة البيانات بجانبه باسم فيه التاريخ، ويرجّع مكان النسخة
+  Future<String> backupDatabase() async {
+    final db = await database;
+    await db
+        .rawQuery('PRAGMA wal_checkpoint(TRUNCATE)'); // يدمج ملف WAL في الأصلي
+    final stamp =
+        DateTime.now().toIso8601String().replaceAll(RegExp(r'[:.]'), '-');
+    final dest = '${db.path}.backup-$stamp';
+    await File(db.path).copy(dest);
+    return dest;
+  }
+
+  /// يحذف كل الحركات والبيانات المالية ويصفّر الأرصدة.
+  /// يفضل دايمًا: المستخدمين والإعدادات وشجرة الحسابات.
+  /// includeMasterData = true يحذف كمان الأصناف والتصنيفات والخامات والوصفات
+  /// والموردين والعملاء والموظفين.
+  Future<void> resetAllData({bool includeMasterData = false}) async {
+    final db = await database;
+    await db.transaction((txn) async {
+      // حركات وبيانات مالية (الأبناء الأول عشان الـ foreign keys)
+      for (final table in [
+        'order_items',
+        'orders',
+        'order_audit_log',
+        'stock_movements',
+        'expenses',
+        'shifts',
+        'treasury_movements',
+        'account_transactions',
+        'purchase_invoice_items',
+        'purchase_invoices',
+        'supplier_payments',
+        'employee_transactions',
+        'inventory_count_items',
+        'inventory_counts',
+        'fixed_assets',
+      ]) {
+        await txn.delete(table);
+      }
+
+      await txn.rawUpdate('UPDATE accounts SET balance = 0');
+      await txn.rawUpdate('UPDATE suppliers SET balance = 0');
+
+      if (includeMasterData) {
+        for (final table in [
+          'product_recipes',
+          'products',
+          'categories',
+          'raw_materials',
+          'customers',
+          'suppliers',
+          'employees',
+        ]) {
+          await txn.delete(table);
+        }
+      }
+
+      await txn.insert(
+        'settings',
+        {'key': 'order_counter', 'value': '0'},
+        conflictAlgorithm: ConflictAlgorithm.replace,
+      );
+    });
+  }
+
+// ═══════════════════════════════════════════════════════════════
+// فحص البيانات الخام (من غير أي فلترة) — عشان نشوف المتخزن فعلًا
+// (حطها جوه كلاس DatabaseHelper)
+// ═══════════════════════════════════════════════════════════════
+  Future<Map<String, List<Map<String, dynamic>>>> getDataDiagnostics() async {
+    return {
+      'expenses': await rawQuery('''
+      SELECT category AS name, COUNT(*) AS cnt, COALESCE(SUM(amount), 0) AS total,
+             MIN(date) AS min_d, MAX(date) AS max_d
+      FROM expenses GROUP BY category'''),
+      'employee_transactions': await rawQuery('''
+      SELECT type AS name, COUNT(*) AS cnt, COALESCE(SUM(amount), 0) AS total,
+             MIN(created_at) AS min_d, MAX(created_at) AS max_d
+      FROM employee_transactions GROUP BY type'''),
+      'supplier_payments': await rawQuery('''
+      SELECT payment_method AS name, COUNT(*) AS cnt, COALESCE(SUM(amount), 0) AS total,
+             MIN(created_at) AS min_d, MAX(created_at) AS max_d
+      FROM supplier_payments GROUP BY payment_method'''),
+    };
+  }
+
+  /// ملخص شامل لصفحة الحسابات — from/to اختياريين (لو null = من البداية لحد دلوقتي)
+  Future<List<Map<String, dynamic>>> getLowStockItems() async {
+    return rawQuery('''
+    SELECT id, name, stock, min_stock, unit, 'product' AS item_type
+    FROM products
+    WHERE is_active = 1 AND min_stock > 0 AND stock <= min_stock
+    UNION ALL
+    SELECT id, name, stock, min_stock, unit, 'raw_material' AS item_type
+    FROM raw_materials
+    WHERE is_active = 1 AND min_stock > 0 AND stock <= min_stock
+    ORDER BY stock ASC
+  ''');
+  }
+
+  /// رقم الأوردر داخل الشيفت (يبدأ من 1 لكل شيفت) — للطباعة بس
+  Future<int> getOrderSequenceInShift(String orderId) async {
+    final rows = await rawQuery('''
+    SELECT COUNT(*) AS n FROM orders
+    WHERE shift_id = (SELECT shift_id FROM orders WHERE id = ?)
+      AND shift_id IS NOT NULL
+      AND (created_at < (SELECT created_at FROM orders WHERE id = ?)
+           OR (created_at = (SELECT created_at FROM orders WHERE id = ?)
+               AND rowid <= (SELECT rowid FROM orders WHERE id = ?)))
+  ''', [orderId, orderId, orderId, orderId]);
+    final n = (rows.first['n'] as num?)?.toInt() ?? 0;
+    return n == 0 ? 1 : n;
+  }
 
   Future<void> addQuickExpense({
     required String category,

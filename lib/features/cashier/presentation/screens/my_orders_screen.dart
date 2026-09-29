@@ -25,16 +25,18 @@ class _MyOrdersScreenState extends State<MyOrdersScreen> {
 
   Future<void> _load() async {
     setState(() => _loading = true);
-    final userId = SessionService.instance.currentUser?.id;
-    if (userId == null) {
-      setState(() {
-        _orders = [];
-        _loading = false;
-      });
+    final shift = await DatabaseHelper.instance.getCurrentShift();
+    if (shift == null) {
+      if (mounted) {
+        setState(() {
+          _orders = [];
+          _loading = false;
+        });
+      }
       return;
     }
-    final orders =
-        await DatabaseHelper.instance.getOrdersByUser(userId, limit: 100);
+    final orders = await DatabaseHelper.instance
+        .getOrdersByShift(shift['id'] as String, limit: 200);
     if (mounted) {
       setState(() {
         _orders = orders;

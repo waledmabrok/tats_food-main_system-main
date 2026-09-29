@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 import '../../../../core/constants/app_strings.dart';
+import '../../../../core/database/database_helper.dart';
 import '../../../../core/services/session_service.dart';
 import '../../../../core/theme/app_colors.dart';
 import '../../../../core/theme/app_dimensions.dart';
@@ -44,22 +45,14 @@ class _DashboardScreenState extends State<DashboardScreen> {
     final todayStart = DateTime(now.year, now.month, now.day);
 
     // المبيعات والطلبات اليوم
-    final todayOrders = await _orderRepo.getAll(
-        from: todayStart, status: OrderStatus.completed);
-
-    _salesToday = todayOrders.fold(0.0, (sum, o) => sum + o.finalAmount);
-    _ordersTotal = todayOrders.length;
-
-    int items = 0;
-    for (var o in todayOrders) {
-      items += o.items.fold(0, (sum, i) => sum + i.quantity.toInt());
-    }
-    _itemsSold = items;
+    final stats = await _orderRepo.getSalesStats(from: todayStart, to: now);
+    _salesToday = (stats['total_sales'] as num).toDouble();
+    _ordersTotal = (stats['order_count'] as num).toInt();
+    _itemsSold = (stats['items_sold'] as num).toInt();
 
     // النواقص
-    final lowStock = await _productRepo.getLowStock();
+    final lowStock = await DatabaseHelper.instance.getLowStockItems();
     _lowStockCount = lowStock.length;
-
     if (mounted) setState(() => _isLoading = false);
   }
 

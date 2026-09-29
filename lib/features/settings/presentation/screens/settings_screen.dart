@@ -27,7 +27,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
   final _phoneCtrl = TextEditingController();
   final _addressCtrl = TextEditingController();
   final _currencyCtrl = TextEditingController();
-
+  bool _cashierCanCloseShift = false;
   bool _isLoading = true;
   bool _isSaving = false;
   bool _isDeletingSales = false;
@@ -43,7 +43,8 @@ class _SettingsScreenState extends State<SettingsScreen> {
 
   Future<void> _loadSettings() async {
     setState(() => _isLoading = true);
-
+    _cashierCanCloseShift =
+        (await _db.getSetting('cashier_can_close_shift')) == '1';
     _nameCtrl.text = await _db.getSetting('restaurant_name') ?? '';
     _phoneCtrl.text = await _db.getSetting('restaurant_phone') ?? '';
     _addressCtrl.text = await _db.getSetting('restaurant_address') ?? '';
@@ -52,9 +53,11 @@ class _SettingsScreenState extends State<SettingsScreen> {
 
     if (mounted) setState(() => _isLoading = false);
   }
+
   Future<void> _saveSettings() async {
     if (!_formKey.currentState!.validate()) return;
-
+    await _db.setSetting(
+        'cashier_can_close_shift', _cashierCanCloseShift ? '1' : '0');
     setState(() => _isSaving = true);
 
     await _db.setSetting('restaurant_name', _nameCtrl.text.trim());
@@ -275,6 +278,86 @@ class _SettingsScreenState extends State<SettingsScreen> {
     super.dispose();
   }
 
+  Future<void> _resetAll() async {
+    bool includeMaster = false;
+    final confirmC = TextEditingController();
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (_) => StatefulBuilder(
+        builder: (context, setLocal) => AlertDialog(
+          title: Row(
+            children: [
+              Icon(Icons.warning_amber_rounded, color: AppColors.error),
+              const SizedBox(width: AppDimensions.space8),
+              const Text('حذف كل البيانات'),
+            ],
+          ),
+          content: SizedBox(
+            width: 440,
+            child: SingleChildScrollView(
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                      'هيتحذف: كل الأوردرات والمصاريف والشيفتات وحركات الدرج الأساسي والمشتريات وسداد الموردين وحركات الموظفين وحركات المخزون والجرد والأصول الثابتة، وكل الأرصدة هتتصفّر.',
+                      style: AppTypography.bodyMedium),
+                  const SizedBox(height: AppDimensions.space8),
+                  Text('هيفضل: المستخدمين والإعدادات.',
+                      style: AppTypography.bodySmall),
+                  CheckboxListTile(
+                    contentPadding: EdgeInsets.zero,
+                    value: includeMaster,
+                    onChanged: (v) =>
+                        setLocal(() => includeMaster = v ?? false),
+                    title: const Text(
+                        'احذف كمان الأصناف والتصنيفات والخامات والوصفات والموردين والعملاء والموظفين'),
+                  ),
+                  Text('هيتاخد نسخة احتياطية من قاعدة البيانات قبل الحذف.',
+                      style: AppTypography.caption),
+                  const SizedBox(height: AppDimensions.space12),
+                  TextField(
+                    controller: confirmC,
+                    onChanged: (_) => setLocal(() {}),
+                    decoration: const InputDecoration(
+                        labelText: 'اكتب كلمة "حذف" للتأكيد'),
+                  ),
+                ],
+              ),
+            ),
+          ),
+          actions: [
+            TextButton(
+                onPressed: () => Navigator.pop(context, false),
+                child: const Text('إلغاء')),
+            FilledButton(
+              style: FilledButton.styleFrom(backgroundColor: AppColors.error),
+              onPressed: confirmC.text.trim() == 'حذف'
+                  ? () => Navigator.pop(context, true)
+                  : null,
+              child: const Text('احذف كل حاجة'),
+            ),
+          ],
+        ),
+      ),
+    );
+    if (ok != true) return;
+
+    String message;
+    try {
+      final db = DatabaseHelper.instance;
+      final backup = await db.backupDatabase(); // لو فشلت مفيش حاجة بتتحذف
+      await db.resetAllData(includeMasterData: includeMaster);
+      message = 'تم الحذف. النسخة الاحتياطية: $backup';
+    } catch (e) {
+      message = 'حصل خطأ ومفيش حاجة اتحذفت: $e';
+    }
+
+    if (!mounted) return;
+    ScaffoldMessenger.of(context)
+        .showSnackBar(SnackBar(content: Text(message)));
+  }
+
   @override
   Widget build(BuildContext context) {
     return Scaffold(
@@ -385,6 +468,20 @@ class _SettingsScreenState extends State<SettingsScreen> {
                                     ],
                                   );
                                 },
+                              ),
+                              const SizedBox(height: 12),
+                              Material(
+                                type: MaterialType.transparency,
+                                child: SwitchListTile(
+                                  contentPadding: EdgeInsets.zero,
+                                  title:
+                                      const Text('السماح للكاشير بقفل الشيفت'),
+                                  subtitle: const Text(
+                                      'يظهر زرار قفل الشيفت في شاشة الكاشير'),
+                                  value: _cashierCanCloseShift,
+                                  onChanged: (v) =>
+                                      setState(() => _cashierCanCloseShift = v),
+                                ),
                               ),
                               _buildField(
                                 AppStrings.settingsRestaurantName,
@@ -761,6 +858,39 @@ class _SettingsScreenState extends State<SettingsScreen> {
                                   ),
                                 ),
                               ),
+                              const SizedBox(height: 16),
+                              Container(
+                                width: double.infinity,
+                                padding:
+                                    const EdgeInsets.all(AppDimensions.space16),
+                                decoration: BoxDecoration(
+                                  color: AppColors.surface,
+                                  borderRadius: BorderRadius.circular(
+                                      AppDimensions.radiusMd),
+                                  border: Border.all(color: AppColors.error),
+                                ),
+                                child: Row(
+                                  children: [
+                                    Icon(Icons.warning_amber_rounded,
+                                        color: AppColors.error),
+                                    const SizedBox(
+                                        width: AppDimensions.space12),
+                                    Expanded(
+                                      child: Text(
+                                          'حذف كل البيانات وتصفير الحسابات (بياخد نسخة احتياطية الأول)',
+                                          style: AppTypography.bodyMedium),
+                                    ),
+                                    FilledButton.icon(
+                                      style: FilledButton.styleFrom(
+                                          backgroundColor: AppColors.error),
+                                      onPressed: _resetAll,
+                                      icon: const Icon(
+                                          Icons.delete_forever_rounded),
+                                      label: const Text('حذف كل حاجة'),
+                                    ),
+                                  ],
+                                ),
+                              )
                             ],
                           ),
                         ),
